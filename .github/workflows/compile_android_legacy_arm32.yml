@@ -1,30 +1,34 @@
-# Compiles a 32-bit Android APK (armeabi-v7a) for devices stuck on old Android versions.
+# 手动触发：Actions → Compile Android legacy arm32 → Run workflow（右上角按钮）
 #
-# Why v1.17.0 is the default:
-#   Flutter 3.35+ requires Android 7 (API 24) and Flutter 3.22+ requires Android 5 (API 21).
-#   LocalSend v1.17.0 (Flutter 3.24.5, minSdk 21) is the last release that runs on Android 5/6.
+# 基线说明：本分支基于 v1.15.1 —— 经真机验证（乐视 X3-55 Pro / Android 5.0.1 / armeabi-v7a），
+# 它是最后一个能正常启动的版本；从 v1.15.2 起（多线程扫描重构）Flutter 引擎在这类老设备上
+# 会 SIGSEGV（__memcpy_base），v1.16.x / v1.17.x / 1.18.x 同样。
 #
-# Trigger it manually ("Run workflow"). `source_ref` can be any tag/branch/commit;
-# the Flutter version is read from that revision's .fvmrc, so the same workflow also
-# builds a plain arm32 APK for newer revisions (which then requires Android 7+).
+# 产物：
+#   1) Actions 运行页的 artifact（LocalSend-<ref>-arm32v7）
+#   2) 自动发布到 GitHub Releases（tag: android5-arm32），可直接下载安装
 #
-# Signing (optional):
-#   Set the repository secrets KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD
-#   to sign with a stable key (needed to upgrade-install over previous builds).
-#   Without them a throwaway keystore is generated for the run.
+# 可选 Secrets（用于保持固定签名，方便覆盖升级）：
+#   KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD
+#   不配置则每次生成临时签名（包与包之间无法覆盖安装）。
 name: Compile Android legacy arm32
 
 on:
   workflow_dispatch:
     inputs:
       source_ref:
-        description: Tag/branch/commit to build (e.g. v1.17.0)
-        required: true
+        description: "要编译的 tag/branch/commit（留空 = 当前分支）"
+        required: false
         type: string
-        default: v1.17.0
+        default: ""
+      flutter_version:
+        description: "Flutter 版本（留空 = 自动读取 .fvmrc）"
+        required: false
+        type: string
+        default: ""
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -33,45 +37,46 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.source_ref || github.ref }}
           fetch-depth: 1
 
-      - name: Resolve source ref
-        id: source
+      - name: Resolve build config
+        id: cfg
         env:
-          REF: ${{ inputs.source_ref }}
+          REF_INPUT: ${{ inputs.source_ref }}
+          FV_INPUT: ${{ inputs.flutter_version }}
         run: |
           set -euo pipefail
-          resolve() { git rev-parse -q --verify "$1^{commit}" 2>/dev/null; }
-          fetch_ref() {
-            local remote="$1"
-            git fetch --force --depth 1 "$remote" \
-              "+refs/tags/$REF:refs/tags/$REF" \
-              "+refs/heads/$REF:refs/remotes/$remote/$REF" 2>/dev/null || true
-          }
+          if [ -f app/pubspec.yaml ]; then app_dir=app; else app_dir=.; fi
 
-          fetch_ref origin
-          target="$(resolve "$REF" || resolve "origin/$REF" || true)"
-          if [ -z "$target" ]; then
-            echo "Ref '$REF' not found in this repository, trying upstream"
-            git remote add upstream https://github.com/localsend/localsend.git 2>/dev/null || true
-            fetch_ref upstream
-            target="$(resolve "$REF" || resolve "upstream/$REF" || true)"
+          fv="$FV_INPUT"
+          if [ -z "$fv" ]; then
+            for f in .fvmrc app/.fvmrc; do
+              if [ -f "$f" ]; then
+                fv="$(python3 -c "import json;print(json.load(open('$f')).get('flutter',''))" 2>/dev/null || true)"
+                [ -n "$fv" ] && break
+              fi
+            done
           fi
-          if [ -z "$target" ]; then
-            echo "::error::Cannot resolve ref '$REF'"
-            exit 1
+          if [ -z "$fv" ]; then
+            for f in .fvm/fvm_config.json app/.fvm/fvm_config.json; do
+              if [ -f "$f" ]; then
+                fv="$(python3 -c "import json;print(json.load(open('$f')).get('flutterSdkVersion',''))" 2>/dev/null || true)"
+                [ -n "$fv" ] && break
+              fi
+            done
           fi
-          git checkout --detach "$target"
+          [ -n "$fv" ] || { echo "::error::无法确定 Flutter 版本，请填写 flutter_version"; exit 1; }
 
-          commit="$(git rev-parse --short HEAD)"
-          flutter_version="$(python3 -c "import json; print(json.load(open('.fvmrc'))['flutter'])")"
-          safe_ref="$(printf '%s' "$REF" | tr '/: ' '---')"
+          ref_label="${REF_INPUT:-${GITHUB_REF_NAME}}"
+          safe_ref="$(printf '%s' "$ref_label" | tr '/: ' '---')"
           {
-            echo "commit=$commit"
-            echo "flutter_version=$flutter_version"
+            echo "app_dir=$app_dir"
+            echo "flutter_version=$fv"
             echo "safe_ref=$safe_ref"
+            echo "commit=$(git rev-parse --short HEAD)"
           } >> "$GITHUB_OUTPUT"
-          echo "Building $REF ($commit) with Flutter $flutter_version"
+          echo "app_dir=$app_dir flutter=$fv ref=$ref_label commit=$(git rev-parse --short HEAD)"
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -82,7 +87,7 @@ jobs:
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: ${{ steps.source.outputs.flutter_version }}
+          flutter-version: ${{ steps.cfg.outputs.flutter_version }}
           channel: stable
           cache: true
 
@@ -92,12 +97,7 @@ jobs:
       - name: Install Android SDK packages
         run: |
           yes | sdkmanager --licenses >/dev/null
-          sdkmanager --install "platforms;android-34" "build-tools;34.0.0" "ndk;23.1.7779620"
-
-      - name: Set up Rust
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup target add --toolchain stable armv7-linux-androideabi
+          sdkmanager --install "platforms;android-33" "platforms;android-34" "build-tools;33.0.0" "build-tools;34.0.0"
 
       - name: Cache Gradle
         uses: actions/cache@v4
@@ -105,9 +105,8 @@ jobs:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: gradle-${{ runner.os }}-${{ hashFiles('app/android/**/*.gradle', 'app/android/**/*.gradle.kts', 'app/android/gradle/wrapper/gradle-wrapper.properties') }}
-          restore-keys: |
-            gradle-${{ runner.os }}-
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/gradle-wrapper.properties', '**/*.gradle') }}
+          restore-keys: gradle-${{ runner.os }}-
 
       - name: Configure signing
         env:
@@ -125,14 +124,14 @@ jobs:
           if [ -n "${KEYSTORE_BASE64:-}" ]; then
             echo "$KEYSTORE_BASE64" | base64 -d > "$keystore"
           else
-            echo "::warning::KEYSTORE_BASE64 is not set, generating a throwaway keystore"
+            echo "::warning::未设置 KEYSTORE_BASE64，本次使用临时签名（无法覆盖升级之前的包）"
             keytool -genkeypair -v -keystore "$keystore" -storetype JKS \
               -keyalg RSA -keysize 2048 -validity 10000 \
               -alias "$alias" -storepass "$store_password" -keypass "$key_password" \
               -dname "CN=LocalSend CI, OU=CI, O=CI, L=Unknown, ST=Unknown, C=CN"
           fi
 
-          cat > app/android/key.properties <<EOF
+          cat > "${{ steps.cfg.outputs.app_dir }}/android/key.properties" <<EOF
           storePassword=$store_password
           keyPassword=$key_password
           keyAlias=$alias
@@ -140,13 +139,13 @@ jobs:
           EOF
 
       - name: Build arm32 release APK
-        working-directory: app
+        working-directory: ${{ steps.cfg.outputs.app_dir }}
         run: |
           flutter pub get
           flutter build apk --release --target-platform android-arm --split-per-abi
 
       - name: Verify APK
-        working-directory: app
+        working-directory: ${{ steps.cfg.outputs.app_dir }}
         run: |
           apk=build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
           sdk="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
@@ -154,9 +153,30 @@ jobs:
           "$aapt" dump badging "$apk" | grep -E "^(package|sdkVersion|targetSdkVersion|native-code)"
           sha256sum "$apk"
 
-      - name: Upload APK
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: LocalSend-${{ steps.source.outputs.safe_ref }}-arm32v7
-          path: app/build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
+          name: LocalSend-${{ steps.cfg.outputs.safe_ref }}-arm32v7
+          path: ${{ steps.cfg.outputs.app_dir }}/build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
           if-no-files-found: error
+
+      - name: Publish to GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="android5-arm32"
+          src="${{ steps.cfg.outputs.app_dir }}/build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk"
+          asset="LocalSend-${{ steps.cfg.outputs.safe_ref }}-${{ steps.cfg.outputs.commit }}-arm32v7.apk"
+          cp "$src" "$RUNNER_TEMP/$asset"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "$RUNNER_TEMP/$asset" --clobber
+          else
+            gh release create "$tag" "$RUNNER_TEMP/$asset" \
+              --title "LocalSend Android 5/6 arm32 (legacy)" \
+              --notes "ref: \`${{ steps.cfg.outputs.safe_ref }}\`  
+          commit: \`${{ steps.cfg.outputs.commit }}\`  
+          Flutter: \`${{ steps.cfg.outputs.flutter_version }}\`  
+          适用：Android 5/6 的 32 位 (armeabi-v7a) 设备" \
+              --prerelease
+          fi
