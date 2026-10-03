@@ -1,0 +1,162 @@
+# Compiles a 32-bit Android APK (armeabi-v7a) for devices stuck on old Android versions.
+#
+# Why v1.17.0 is the default:
+#   Flutter 3.35+ requires Android 7 (API 24) and Flutter 3.22+ requires Android 5 (API 21).
+#   LocalSend v1.17.0 (Flutter 3.24.5, minSdk 21) is the last release that runs on Android 5/6.
+#
+# Trigger it manually ("Run workflow"). `source_ref` can be any tag/branch/commit;
+# the Flutter version is read from that revision's .fvmrc, so the same workflow also
+# builds a plain arm32 APK for newer revisions (which then requires Android 7+).
+#
+# Signing (optional):
+#   Set the repository secrets KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD
+#   to sign with a stable key (needed to upgrade-install over previous builds).
+#   Without them a throwaway keystore is generated for the run.
+name: Compile Android legacy arm32
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Tag/branch/commit to build (e.g. v1.17.0)
+        required: true
+        type: string
+        default: v1.17.0
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Resolve source ref
+        id: source
+        env:
+          REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          resolve() { git rev-parse -q --verify "$1^{commit}" 2>/dev/null; }
+          fetch_ref() {
+            local remote="$1"
+            git fetch --force --depth 1 "$remote" \
+              "+refs/tags/$REF:refs/tags/$REF" \
+              "+refs/heads/$REF:refs/remotes/$remote/$REF" 2>/dev/null || true
+          }
+
+          fetch_ref origin
+          target="$(resolve "$REF" || resolve "origin/$REF" || true)"
+          if [ -z "$target" ]; then
+            echo "Ref '$REF' not found in this repository, trying upstream"
+            git remote add upstream https://github.com/localsend/localsend.git 2>/dev/null || true
+            fetch_ref upstream
+            target="$(resolve "$REF" || resolve "upstream/$REF" || true)"
+          fi
+          if [ -z "$target" ]; then
+            echo "::error::Cannot resolve ref '$REF'"
+            exit 1
+          fi
+          git checkout --detach "$target"
+
+          commit="$(git rev-parse --short HEAD)"
+          flutter_version="$(python3 -c "import json; print(json.load(open('.fvmrc'))['flutter'])")"
+          safe_ref="$(printf '%s' "$REF" | tr '/: ' '---')"
+          {
+            echo "commit=$commit"
+            echo "flutter_version=$flutter_version"
+            echo "safe_ref=$safe_ref"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building $REF ($commit) with Flutter $flutter_version"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ steps.source.outputs.flutter_version }}
+          channel: stable
+          cache: true
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager --install "platforms;android-34" "build-tools;34.0.0" "ndk;23.1.7779620"
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add --toolchain stable armv7-linux-androideabi
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('app/android/**/*.gradle', 'app/android/**/*.gradle.kts', 'app/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Configure signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          store_password="${KEYSTORE_PASSWORD:-localsend}"
+          alias="${KEY_ALIAS:-localsend}"
+          key_password="${KEY_PASSWORD:-$store_password}"
+          keystore="$RUNNER_TEMP/localsend-release.jks"
+
+          if [ -n "${KEYSTORE_BASE64:-}" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$keystore"
+          else
+            echo "::warning::KEYSTORE_BASE64 is not set, generating a throwaway keystore"
+            keytool -genkeypair -v -keystore "$keystore" -storetype JKS \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -alias "$alias" -storepass "$store_password" -keypass "$key_password" \
+              -dname "CN=LocalSend CI, OU=CI, O=CI, L=Unknown, ST=Unknown, C=CN"
+          fi
+
+          cat > app/android/key.properties <<EOF
+          storePassword=$store_password
+          keyPassword=$key_password
+          keyAlias=$alias
+          storeFile=$keystore
+          EOF
+
+      - name: Build arm32 release APK
+        working-directory: app
+        run: |
+          flutter pub get
+          flutter build apk --release --target-platform android-arm --split-per-abi
+
+      - name: Verify APK
+        working-directory: app
+        run: |
+          apk=build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
+          sdk="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          aapt="$(ls "$sdk"/build-tools/*/aapt | sort -V | tail -1)"
+          "$aapt" dump badging "$apk" | grep -E "^(package|sdkVersion|targetSdkVersion|native-code)"
+          sha256sum "$apk"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocalSend-${{ steps.source.outputs.safe_ref }}-arm32v7
+          path: app/build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
+          if-no-files-found: error
